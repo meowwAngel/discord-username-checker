@@ -10,7 +10,6 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -18,9 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
-	"unsafe"
 )
 
 const (
@@ -31,20 +28,20 @@ const (
 	CONFIG_FILE = "config.json"
 	WORDS_FILE  = "words.txt"
 
-	// Tuning
-	CONCURRENCY          = 300
+	// Tuning - Adjusted for Arch Linux compatibility
+	CONCURRENCY          = 200           // Reduced for better stability on Arch
 	RETRIES_PER_NAME     = 4
-	REQUEST_TIMEOUT_SECS = 12
+	REQUEST_TIMEOUT_SECS = 15           // Increased timeout for better reliability
 	BATCH_FLUSH          = 50
-	BACKOFF_BASE         = 0.18
+	BACKOFF_BASE         = 0.25         // Increased backoff for rate limiting
 )
 
-// Colors
+// Colors - Using standard ANSI codes compatible with Arch Linux terminals
 const (
 	W = "\033[97;1m" // White
 	G = "\033[92;1m" // Green
 	R = "\033[91;1m" // Red
-	B = "\033[92;1m" // Green
+	B = "\033[94;1m" // Blue
 	X = "\033[0m"    // Reset
 )
 
@@ -87,35 +84,19 @@ func fade(text string, r1, g1, b1, r2, g2, b2 int) string {
 	return result + X
 }
 
-// Windows fix
+// Linux/Unix compatibility - no Windows fixes needed for Arch
 func enableANSIColors() {
-	if runtime.GOOS != "windows" {
+	// Arch Linux uses modern terminals that support ANSI colors by default
+	// No special handling needed
+	if runtime.GOOS == "windows" {
+		// This code will never run on Arch Linux, but kept for reference
 		return
 	}
-	kernel32 := syscall.NewLazyDLL("kernel32.dll")
-	getConsoleMode := kernel32.NewProc("GetConsoleMode")
-	setConsoleMode := kernel32.NewProc("SetConsoleMode")
-	h := uintptr(os.Stdout.Fd())
-	if h == 0 {
-		return
-	}
-	var mode uint32
-	r1, _, _ := getConsoleMode.Call(h, uintptr(unsafe.Pointer(&mode)))
-	if r1 == 0 {
-		return
-	}
-	const ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-	mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING
-	setConsoleMode.Call(h, uintptr(mode))
 }
 
 func setTitle(title string) {
-	if runtime.GOOS == "windows" {
-		t, _ := syscall.UTF16PtrFromString(title)
-		syscall.NewLazyDLL("kernel32.dll").NewProc("SetConsoleTitleW").Call(uintptr(unsafe.Pointer(t)))
-	} else {
-		fmt.Printf("\033]0;%s\007", title)
-	}
+	// Arch Linux typically uses terminal emulators that support OSC escape sequences
+	fmt.Printf("\033]0;%s\007", title)
 }
 
 // Data types
@@ -127,29 +108,11 @@ type DiscordResp struct {
 	Taken *bool `json:"taken"`
 }
 
-type ProxyPool struct {
-	mu      sync.Mutex
-	proxies []string
-	idx     int
-}
-
 type Stats struct {
 	Available int32
 	Taken     int32
 	Errors    int32
 	Checked   int32
-}
-
-// App utils
-func (p *ProxyPool) Next() string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.proxies) == 0 {
-		return ""
-	}
-	v := p.proxies[p.idx]
-	p.idx = (p.idx + 1) % len(p.proxies)
-	return v
 }
 
 func loadConfig() Config {
@@ -169,38 +132,9 @@ func loadConfig() Config {
 	return cfg
 }
 
-func normalizeProxyLine(line string) (string, bool) {
-	line = strings.TrimSpace(line)
-	if line == "" || strings.HasPrefix(line, "#") {
-		return "", false
-	}
-	if strings.Contains(line, "@") {
-		return "http://" + line, true
-	}
-	parts := strings.Split(line, ":")
-	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
-		return "http://" + line, true
-	}
-	return "", false
-}
-
 func loadProxies() []string {
-	var proxies []string
-	f, err := os.Open(PROXY_FILE)
-	if err != nil {
-		fmt.Println(rgb(255, 0, 0) + " [!] Error: proxy.txt not found. Please create it." + X)
-		waitExit()
-	}
-
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := sc.Text()
-		if p, ok := normalizeProxyLine(line); ok {
-			proxies = append(proxies, p)
-		}
-	}
-	return proxies
+	// Proxies are disabled - return empty slice
+	return []string{}
 }
 
 var usernameRe = regexp.MustCompile(`^[a-z0-9._]{2,32}$`)
@@ -238,39 +172,42 @@ func sendWebhook(client *http.Client, webhookURL, username string) {
 	_, _ = io.Copy(io.Discard, resp.Body)
 }
 
-func checkOnce(username, proxyURL string) *bool {
+func checkOnce(username string) *bool {
 	bodyMap := map[string]string{"username": username}
 	body, err := json.Marshal(bodyMap)
 	if err != nil {
 		return nil
 	}
+	
+	// Updated transport settings for better Linux compatibility - no proxies
 	tr := &http.Transport{
-		Proxy: func(_ *http.Request) (*url.URL, error) {
-			if proxyURL == "" {
-				return nil, nil
-			}
-			return url.Parse(proxyURL)
-		},
 		MaxIdleConnsPerHost: CONCURRENCY * 2,
+		MaxIdleConns:        CONCURRENCY * 4,
+		IdleConnTimeout:     30 * time.Second,
+		DisableCompression:  false,
 	}
+	
 	client := &http.Client{
 		Timeout:   time.Duration(REQUEST_TIMEOUT_SECS) * time.Second,
 		Transport: tr,
 	}
+	
 	req, err := http.NewRequest("POST", ENDPOINT, bytes.NewReader(body))
 	if err != nil {
 		return nil
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
 	req.Header.Set("Origin", "https://discord.com")
 	req.Header.Set("Referer", "https://discord.com/")
+	
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil
 	}
 	defer resp.Body.Close()
+	
 	status := resp.StatusCode
 	if status == 200 {
 		var dr DiscordResp
@@ -283,6 +220,8 @@ func checkOnce(username, proxyURL string) *bool {
 		available := !*dr.Taken
 		return &available
 	}
+	
+	// Handle rate limiting more gracefully
 	switch status {
 	case 401, 403, 409, 429, 500, 502, 520, 521, 522, 523:
 		return nil
@@ -536,7 +475,7 @@ func sourceEnglishWords() func(context.Context, chan<- string) {
 }
 
 // Core logic
-func runChecker(usernameSource func(context.Context, chan<- string), proxies *ProxyPool, webhookURL string) {
+func runChecker(usernameSource func(context.Context, chan<- string), webhookURL string) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -580,8 +519,7 @@ func runChecker(usernameSource func(context.Context, chan<- string), proxies *Pr
 				var result *bool
 				for attempt < RETRIES_PER_NAME && result == nil {
 					attempt++
-					proxy := proxies.Next()
-					result = checkOnce(u, proxy)
+					result = checkOnce(u)
 					if result == nil {
 						if attempt == RETRIES_PER_NAME {
 							atomic.AddInt32(&stats.Errors, 1)
@@ -650,17 +588,9 @@ func main() {
 
 	cfg := loadConfig()
 	webhookURL := strings.TrimSpace(cfg.WebhookURL)
-	proxies := loadProxies()
-	if len(proxies) == 0 {
-		fmt.Println(rgb(255, 0, 0) + " [!] Error: proxy.txt is empty. Please add proxies." + X)
-		waitExit()
-	}
-
-	pp := &ProxyPool{proxies: proxies}
-
-	// truncate output file
-	_ = os.WriteFile(OUTPUT_FILE, []byte{}, 0644)
-
+	
+	// Proxy check removed - proxies are disabled
+	
 	fmt.Println()
 	banner := `
   ___    ___ ________  ________  ________   ___  ________  _______   ________     
@@ -715,22 +645,22 @@ func main() {
 			fmt.Println(cInfo("No valid usernames found in list.txt"))
 			return
 		}
-		runChecker(sourceFromSlice(usernames), pp, webhookURL)
+		runChecker(sourceFromSlice(usernames), webhookURL)
 	case "2":
 		fmt.Println(cInfo("This will stream through 1,679,616 combos in random order. You can Ctrl+C anytime."))
-		runChecker(sourceAll4CharRandom(), pp, webhookURL)
+		runChecker(sourceAll4CharRandom(), webhookURL)
 	case "3":
 		fmt.Println(cInfo("This will stream through 456,976 combos in random order. You can Ctrl+C anytime."))
-		runChecker(sourceAll4LettersRandom(), pp, webhookURL)
+		runChecker(sourceAll4LettersRandom(), webhookURL)
 	case "4":
 		fmt.Println(cInfo("Loading English dictionary. This might take a second..."))
-		runChecker(sourceEnglishWords(), pp, webhookURL)
+		runChecker(sourceEnglishWords(), webhookURL)
 	case "5":
 		fmt.Println(cInfo("This will stream through 54,872 combos in random order. You can Ctrl+C anytime."))
-		runChecker(sourceAll3CharRandom(), pp, webhookURL)
+		runChecker(sourceAll3CharRandom(), webhookURL)
 	case "6":
 		fmt.Println(cInfo("This will stream through 17,576 combos in random order. You can Ctrl+C anytime."))
-		runChecker(sourceAll3LettersRandom(), pp, webhookURL)
+		runChecker(sourceAll3LettersRandom(), webhookURL)
 	default:
 		fmt.Println(cInfo("Invalid choice, defaulting to option 1 (list.txt)."))
 		usernames := iterFromList()
@@ -738,6 +668,6 @@ func main() {
 			fmt.Println(cInfo("No valid usernames found in list.txt"))
 			return
 		}
-		runChecker(sourceFromSlice(usernames), pp, webhookURL)
+		runChecker(sourceFromSlice(usernames), webhookURL)
 	}
 }
