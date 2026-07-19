@@ -28,21 +28,23 @@ const (
 	CONFIG_FILE = "config.json"
 	WORDS_FILE  = "words.txt"
 
-	// Tuning - Adjusted for Arch Linux compatibility
-	CONCURRENCY          = 200           // Reduced for better stability on Arch
-	RETRIES_PER_NAME     = 4
-	REQUEST_TIMEOUT_SECS = 15           // Increased timeout for better reliability
+	// Conservative tuning to avoid rate limiting
+	CONCURRENCY          = 10            // Very low to avoid rate limiting
+	RETRIES_PER_NAME     = 3
+	REQUEST_TIMEOUT_SECS = 20
 	BATCH_FLUSH          = 50
-	BACKOFF_BASE         = 0.25         // Increased backoff for rate limiting
+	BACKOFF_BASE         = 1.0          // Start with 1 second backoff
+	MAX_BACKOFF          = 30.0         // Max backoff of 30 seconds
 )
 
-// Colors - Using standard ANSI codes compatible with Arch Linux terminals
+// Colors
 const (
-	W = "\033[97;1m" // White
-	G = "\033[92;1m" // Green
-	R = "\033[91;1m" // Red
-	B = "\033[94;1m" // Blue
-	X = "\033[0m"    // Reset
+	W = "\033[97;1m"
+	G = "\033[92;1m"
+	R = "\033[91;1m"
+	B = "\033[94;1m"
+	Y = "\033[93;1m"
+	X = "\033[0m"
 )
 
 func cAvailable(u string) string {
@@ -55,6 +57,14 @@ func cTaken(u string) string {
 
 func cInfo(msg string) string {
 	return fmt.Sprintf("%s[i]%s %s", W, X, msg)
+}
+
+func cError(msg string) string {
+	return fmt.Sprintf("%s[!]%s %s", R, X, msg)
+}
+
+func cDebug(msg string) string {
+	return fmt.Sprintf("%s[debug]%s %s", Y, X, msg)
 }
 
 func waitExit() {
@@ -84,22 +94,16 @@ func fade(text string, r1, g1, b1, r2, g2, b2 int) string {
 	return result + X
 }
 
-// Linux/Unix compatibility - no Windows fixes needed for Arch
 func enableANSIColors() {
-	// Arch Linux uses modern terminals that support ANSI colors by default
-	// No special handling needed
 	if runtime.GOOS == "windows" {
-		// This code will never run on Arch Linux, but kept for reference
 		return
 	}
 }
 
 func setTitle(title string) {
-	// Arch Linux typically uses terminal emulators that support OSC escape sequences
 	fmt.Printf("\033]0;%s\007", title)
 }
 
-// Data types
 type Config struct {
 	WebhookURL string `json:"webhook_url"`
 }
@@ -113,28 +117,24 @@ type Stats struct {
 	Taken     int32
 	Errors    int32
 	Checked   int32
+	RateLimit int32
 }
 
 func loadConfig() Config {
 	var cfg Config
 	f, err := os.Open(CONFIG_FILE)
 	if err != nil {
-		fmt.Println(rgb(255, 0, 0) + " [!] Error: config.json not found. Please create it." + X)
+		fmt.Println(cError("config.json not found. Please create it."))
 		waitExit()
 	}
 	defer f.Close()
 
 	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
-		fmt.Println(rgb(255, 0, 0) + " [!] Error: Failed to parse config.json." + X)
+		fmt.Println(cError("Failed to parse config.json."))
 		waitExit()
 	}
 
 	return cfg
-}
-
-func loadProxies() []string {
-	// Proxies are disabled - return empty slice
-	return []string{}
 }
 
 var usernameRe = regexp.MustCompile(`^[a-z0-9._]{2,32}$`)
@@ -172,17 +172,16 @@ func sendWebhook(client *http.Client, webhookURL, username string) {
 	_, _ = io.Copy(io.Discard, resp.Body)
 }
 
-func checkOnce(username string) *bool {
+func checkOnce(username string) (bool, error) {
 	bodyMap := map[string]string{"username": username}
 	body, err := json.Marshal(bodyMap)
 	if err != nil {
-		return nil
+		return false, err
 	}
 	
-	// Updated transport settings for better Linux compatibility - no proxies
 	tr := &http.Transport{
-		MaxIdleConnsPerHost: CONCURRENCY * 2,
-		MaxIdleConns:        CONCURRENCY * 4,
+		MaxIdleConnsPerHost: 5,
+		MaxIdleConns:        10,
 		IdleConnTimeout:     30 * time.Second,
 		DisableCompression:  false,
 	}
@@ -194,7 +193,7 @@ func checkOnce(username string) *bool {
 	
 	req, err := http.NewRequest("POST", ENDPOINT, bytes.NewReader(body))
 	if err != nil {
-		return nil
+		return false, err
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
@@ -204,29 +203,44 @@ func checkOnce(username string) *bool {
 	
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil
+		return false, err
 	}
 	defer resp.Body.Close()
 	
 	status := resp.StatusCode
-	if status == 200 {
-		var dr DiscordResp
-		if err := json.NewDecoder(resp.Body).Decode(&dr); err != nil {
-			return nil
-		}
-		if dr.Taken == nil {
-			return nil
-		}
-		available := !*dr.Taken
-		return &available
+	
+	// Read body for debugging
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyStr := string(bodyBytes)
+	
+	// Debug output for non-200 responses
+	if status != 200 {
+		fmt.Printf("%s %s (status %d): %s\n", cDebug("Response"), username, status, bodyStr)
 	}
 	
-	// Handle rate limiting more gracefully
+	if status == 200 {
+		var dr DiscordResp
+		if err := json.Unmarshal(bodyBytes, &dr); err != nil {
+			return false, fmt.Errorf("json parse error: %v", err)
+		}
+		if dr.Taken == nil {
+			return false, fmt.Errorf("taken field is nil")
+		}
+		return !*dr.Taken, nil
+	}
+	
+	// Handle different status codes
 	switch status {
-	case 401, 403, 409, 429, 500, 502, 520, 521, 522, 523:
-		return nil
+	case 429:
+		return false, fmt.Errorf("RATE_LIMITED")
+	case 403:
+		return false, fmt.Errorf("FORBIDDEN")
+	case 401:
+		return false, fmt.Errorf("UNAUTHORIZED")
+	case 500, 502, 503, 504:
+		return false, fmt.Errorf("SERVER_ERROR")
 	default:
-		return nil
+		return false, fmt.Errorf("status %d: %s", status, bodyStr)
 	}
 }
 
@@ -244,7 +258,6 @@ func appendToFile(path string, lines []string) {
 	}
 }
 
-// List iteration
 func iterFromList() []string {
 	f, err := os.Open(LIST_FILE)
 	if err != nil {
@@ -284,7 +297,6 @@ func sourceFromSlice(slice []string) func(context.Context, chan<- string) {
 	}
 }
 
-// 4char generation
 func all4CharCombos() []string {
 	alphabet := "abcdefghijklmnopqrstuvwxyz0123456789"
 	n := len(alphabet)
@@ -303,7 +315,6 @@ func all4CharCombos() []string {
 	return combos
 }
 
-// 4letter generation
 func all4LetterCombos() []string {
 	alphabet := "abcdefghijklmnopqrstuvwxyz"
 	n := len(alphabet)
@@ -358,7 +369,6 @@ func sourceAll4LettersRandom() func(context.Context, chan<- string) {
 	}
 }
 
-// 3char generation
 func all3CharCombos() []string {
 	alphabet := "abcdefghijklmnopqrstuvwxyz0123456789._"
 	n := len(alphabet)
@@ -375,11 +385,10 @@ func all3CharCombos() []string {
 	return combos
 }
 
-// generate ALL 3-letter [a-z] combos, then shuffle
 func all3LetterCombos() []string {
 	alphabet := "abcdefghijklmnopqrstuvwxyz"
 	n := len(alphabet)
-	total := n * n * n // 26^3 = 17,576
+	total := n * n * n
 	combos := make([]string, 0, total)
 
 	for i := 0; i < n; i++ {
@@ -393,7 +402,6 @@ func all3LetterCombos() []string {
 	return combos
 }
 
-// random order source for all 3-char
 func sourceAll3CharRandom() func(context.Context, chan<- string) {
 	return func(ctx context.Context, ch chan<- string) {
 		fmt.Println(cInfo("Generating 54,872 combinations..."))
@@ -412,7 +420,6 @@ func sourceAll3CharRandom() func(context.Context, chan<- string) {
 	}
 }
 
-// random order source for all 3-letter
 func sourceAll3LettersRandom() func(context.Context, chan<- string) {
 	return func(ctx context.Context, ch chan<- string) {
 		fmt.Println(cInfo("Generating 17,576 combinations..."))
@@ -437,14 +444,14 @@ func sourceEnglishWords() func(context.Context, chan<- string) {
 			fmt.Println(cInfo("Downloading English wordlist (approx 4MB)..."))
 			resp, err := http.Get("https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt")
 			if err != nil {
-				fmt.Println(cInfo("Error downloading wordlist: " + err.Error()))
+				fmt.Println(cError("Error downloading wordlist: " + err.Error()))
 				return
 			}
 			defer resp.Body.Close()
 
 			f, err := os.Create(WORDS_FILE)
 			if err != nil {
-				fmt.Println(cInfo("Error creating words.txt: " + err.Error()))
+				fmt.Println(cError("Error creating words.txt: " + err.Error()))
 				return
 			}
 			_, _ = io.Copy(f, resp.Body)
@@ -454,7 +461,7 @@ func sourceEnglishWords() func(context.Context, chan<- string) {
 
 		f, err := os.Open(WORDS_FILE)
 		if err != nil {
-			fmt.Println(cInfo("Error opening words.txt: " + err.Error()))
+			fmt.Println(cError("Error opening words.txt: " + err.Error()))
 			return
 		}
 		defer f.Close()
@@ -474,7 +481,6 @@ func sourceEnglishWords() func(context.Context, chan<- string) {
 	}
 }
 
-// Core logic
 func runChecker(usernameSource func(context.Context, chan<- string), webhookURL string) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -486,6 +492,10 @@ func runChecker(usernameSource func(context.Context, chan<- string), webhookURL 
 	var stats Stats
 	var outMu sync.Mutex
 	availBuf := make([]string, 0, BATCH_FLUSH)
+	
+	// Global rate limit state
+	var rateLimitUntil int64
+	var rateLimitMu sync.Mutex
 
 	webhookClient := &http.Client{
 		Timeout: time.Duration(REQUEST_TIMEOUT_SECS) * time.Second,
@@ -497,9 +507,9 @@ func runChecker(usernameSource func(context.Context, chan<- string), webhookURL 
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(500 * time.Millisecond):
-				setTitle(fmt.Sprintf("xpniped | Avail: %d | Taken: %d | Err: %d",
-					stats.Available, stats.Taken, stats.Errors))
+			case <-time.After(1 * time.Second):
+				setTitle(fmt.Sprintf("xpniped | Avail: %d | Taken: %d | Err: %d | Checked: %d | RL: %d",
+					stats.Available, stats.Taken, stats.Errors, stats.Checked, stats.RateLimit))
 			}
 		}
 	}()
@@ -515,27 +525,81 @@ func runChecker(usernameSource func(context.Context, chan<- string), webhookURL 
 					return
 				}
 
+				// Check if we're globally rate limited
+				rateLimitMu.Lock()
+				if time.Now().Unix() < rateLimitUntil {
+					waitTime := time.Duration(rateLimitUntil-time.Now().Unix()) * time.Second
+					rateLimitMu.Unlock()
+					fmt.Printf("%s Rate limited, waiting %v...\n", cDebug(""), waitTime)
+					time.Sleep(waitTime)
+					// Put the username back in the queue
+					select {
+					case jobs <- u:
+						continue
+					case <-ctx.Done():
+						return
+					}
+				}
+				rateLimitMu.Unlock()
+
 				attempt := 0
-				var result *bool
-				for attempt < RETRIES_PER_NAME && result == nil {
+				var available bool
+				var err error
+				var success bool
+				
+				for attempt < RETRIES_PER_NAME && !success {
 					attempt++
-					result = checkOnce(u)
-					if result == nil {
+					available, err = checkOnce(u)
+					if err != nil {
+						errMsg := err.Error()
+						
+						// Handle rate limiting
+						if strings.Contains(errMsg, "RATE_LIMITED") {
+							atomic.AddInt32(&stats.RateLimit, 1)
+							rateLimitMu.Lock()
+							// Wait 30 seconds when rate limited
+							rateLimitUntil = time.Now().Unix() + 30
+							rateLimitMu.Unlock()
+							
+							// Put username back in queue
+							time.Sleep(5 * time.Second)
+							select {
+							case jobs <- u:
+								continue
+							case <-ctx.Done():
+								return
+							}
+						} else if strings.Contains(errMsg, "FORBIDDEN") || strings.Contains(errMsg, "UNAUTHORIZED") {
+							// These are permanent errors, don't retry
+							atomic.AddInt32(&stats.Errors, 1)
+							fmt.Printf("%s %s - %s\n", cError("Error checking"), u, errMsg)
+							success = false
+							break
+						}
+						
 						if attempt == RETRIES_PER_NAME {
 							atomic.AddInt32(&stats.Errors, 1)
+							if !strings.Contains(errMsg, "RATE_LIMITED") {
+								fmt.Printf("%s %s - %s (after %d attempts)\n", cError("Failed"), u, errMsg, attempt)
+							}
 						}
-						backoff := BACKOFF_BASE*math.Pow(1.5, float64(attempt-1)) + rand.Float64()*0.15
+						
+						// Exponential backoff
+						backoff := math.Min(BACKOFF_BASE*math.Pow(2.0, float64(attempt-1)), MAX_BACKOFF)
+						backoff += rand.Float64() * 0.5
 						time.Sleep(time.Duration(backoff * float64(time.Second)))
+					} else {
+						success = true
 					}
+				}
+
+				if !success {
+					continue
 				}
 
 				atomic.AddInt32(&stats.Checked, 1)
 
-				if result == nil {
-					continue
-				}
-
-				if *result {
+				if available {
 					atomic.AddInt32(&stats.Available, 1)
 					outMu.Lock()
 
@@ -552,10 +616,11 @@ func runChecker(usernameSource func(context.Context, chan<- string), webhookURL 
 					}
 				} else {
 					atomic.AddInt32(&stats.Taken, 1)
-					outMu.Lock()
 					fmt.Println(cTaken(u))
-					outMu.Unlock()
 				}
+				
+				// Add a small delay between requests to avoid rate limiting
+				time.Sleep(200 * time.Millisecond)
 
 			}
 		}
@@ -580,7 +645,6 @@ func runChecker(usernameSource func(context.Context, chan<- string), webhookURL 
 	outMu.Unlock()
 }
 
-// Main entry
 func main() {
 
 	enableANSIColors()
@@ -588,8 +652,6 @@ func main() {
 
 	cfg := loadConfig()
 	webhookURL := strings.TrimSpace(cfg.WebhookURL)
-	
-	// Proxy check removed - proxies are disabled
 	
 	fmt.Println()
 	banner := `
@@ -604,7 +666,6 @@ func main() {
 
 	lines := strings.Split(banner, "\n")
 	for _, line := range lines {
-		// Gradient from Green (0, 255, 0) to White (255, 255, 255)
 		fmt.Println("  " + fade(line, 0, 255, 128, 255, 255, 255))
 	}
 
